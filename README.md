@@ -8,27 +8,39 @@ This controller watches for namespaces with an `appOwner` label and automaticall
 
 ## How It Works
 
-1. The controller watches all namespaces in the cluster
-2. When a namespace has the `appOwner` label, it searches for a Rancher Project with a matching display name
-3. Once found, it adds the following to the namespace:
+**Architecture**: The operator runs on the Rancher management cluster and manages namespaces across all downstream clusters that are registered with Rancher.
+
+1. The controller watches all namespaces across all clusters registered with Rancher (via Rancher's management API)
+2. When a namespace (on any downstream cluster) has the `appOwner` label, it searches for a Rancher Project with a matching display name
+3. Once found (or created if it doesn't exist), it adds the following to the namespace:
    - Label: `field.cattle.io/projectId: <project-id>`
    - Label: `field.cattle.io/clusterId: <cluster-id>` (if available)
    - Annotation: `field.cattle.io/projectId: <project-id>`
 
+**Important Notes**:
+- The operator uses Rancher's management API (`management.cattle.io/v3`) to access resources across all managed clusters
+- This API is only available on the Rancher management cluster, which is why the operator must be deployed there
+- The operator can manage namespaces on any downstream cluster that is registered with Rancher
+- Namespace updates are applied directly to the downstream clusters via Rancher's cluster API proxy
+
 ## Prerequisites
 
-- Kubernetes cluster joined to Rancher
-- Access to Rancher's management API (management.cattle.io/v3)
+**IMPORTANT**: This operator must be deployed on the **Rancher management cluster** (where Rancher itself is running), **NOT** on downstream clusters that have the Rancher agent (cattle) installed.
+
+- Rancher management cluster (where Rancher is deployed)
+- Access to Rancher's management API (management.cattle.io/v3) - only available on the management cluster
 - RBAC permissions to:
-  - List, watch, get, update, and patch namespaces
-  - List and watch Rancher Projects (management.cattle.io/v3)
+  - List, watch, get, update, and patch namespaces (on downstream clusters via Rancher)
+  - List, watch, and create Rancher Projects (management.cattle.io/v3)
 
 ## Installation
+
+**Deployment Location**: Deploy this operator on your **Rancher management cluster**, not on downstream clusters.
 
 ### Option 1: Using Helm Chart (Recommended)
 
 ```bash
-# Install using the Helm chart
+# Install on the Rancher management cluster
 helm install qn-rancher-operator ./charts/qn-rancher-operator \
   --set image.repository=ghcr.io/quiknode-labs/qn-rancher-operator \
   --set image.tag=latest \
@@ -152,14 +164,16 @@ make test
 
 If the controller can't find Rancher Projects, check:
 
-1. **RBAC Permissions**: Ensure the service account has permissions to list projects:
+1. **Deployment Location**: Ensure the operator is deployed on the **Rancher management cluster**, not on a downstream cluster. The management API (`management.cattle.io/v3`) is only available on the management cluster.
+
+2. **RBAC Permissions**: Ensure the service account has permissions to list projects:
    ```bash
    kubectl auth can-i list projects.management.cattle.io --as=system:serviceaccount:qn-rancher-operator-system:qn-rancher-operator-controller-manager
    ```
 
-2. **Rancher API Access**: Verify that the management API is accessible from the cluster
+3. **Rancher API Access**: Verify that the management API is accessible from the cluster. If you're on a downstream cluster, you won't have access to this API.
 
-3. **Project Names**: Ensure the project display name matches the `appOwner` label exactly (case-insensitive)
+4. **Project Names**: Ensure the project display name matches the `appOwner` label exactly (case-insensitive)
 
 ### Namespace Not Being Assigned
 

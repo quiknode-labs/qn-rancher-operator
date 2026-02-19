@@ -2,6 +2,17 @@
 
 This document explains the architecture and function call flow of the QN Rancher Operator controller.
 
+## ⚠️ Important: Deployment Architecture
+
+**This operator MUST be deployed on the Rancher management cluster** (where Rancher itself is running), **NOT** on downstream clusters that have the Rancher agent (cattle) installed.
+
+The operator uses Rancher's management API (`management.cattle.io/v3`) to:
+- Access Rancher Projects (only available on management cluster)
+- Manage namespaces across all downstream clusters registered with Rancher
+- Create new Rancher Projects when needed
+
+This centralized approach allows the operator to manage namespaces across all clusters from a single deployment point.
+
 ## Mermaid Diagram
 
 ```mermaid
@@ -115,32 +126,51 @@ sequenceDiagram
 
 ## High-Level Architecture
 
+**Deployment**: The operator runs on the **Rancher Management Cluster** and manages namespaces across all downstream clusters.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Kubernetes Cluster                      │
+│              Rancher Management Cluster                         │
+│  (Where Rancher and this operator are deployed)                 │
 │                                                                  │
 │  ┌──────────────────┐         ┌──────────────────────────┐   │
-│  │   Namespaces     │◄────────┤  Controller Manager       │   │
-│  │  (with appOwner  │         │  (controller-runtime)     │   │
-│  │     labels)      │         │                           │   │
+│  │ Rancher Projects │◄────────┤  Rancher Management API │   │
+│  │ (management.cattle│         │  (management.cattle.io)│   │
+│  │      .io/v3)      │         │                          │   │
 │  └──────────────────┘         └──────────────────────────┘   │
 │           ▲                              │                      │
 │           │                              │                      │
 │           │                              ▼                      │
 │           │                    ┌──────────────────────────┐   │
 │           │                    │  NamespaceReconciler     │   │
-│           │                    │  (Our Controller)        │   │
+│           │                    │  (Our Controller)         │   │
 │           │                    └──────────────────────────┘   │
 │           │                              │                      │
 │           │                              │                      │
 │           └──────────────────────────────┘                      │
 │                                                                  │
-│  ┌──────────────────┐         ┌──────────────────────────┐   │
-│  │ Rancher Projects │◄────────┤  Rancher Management API   │   │
-│  │ (management.cattle│         │  (management.cattle.io)   │   │
-│  │      .io/v3)      │         │                           │   │
-│  └──────────────────┘         └──────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │  Controller Manager (controller-runtime)                 │ │
+│  │  Watches namespaces across all clusters via Rancher API  │ │
+│  └──────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (via Rancher Management API)
+                              │
+        ┌─────────────────────┴─────────────────────┐
+        │                                           │
+        ▼                                           ▼
+┌──────────────────┐                    ┌──────────────────┐
+│ Downstream       │                    │ Downstream       │
+│ Cluster 1        │                    │ Cluster 2        │
+│                  │                    │                  │
+│ ┌──────────────┐ │                    │ ┌──────────────┐ │
+│ │  Namespaces  │ │                    │ │  Namespaces  │ │
+│ │ (with        │ │                    │ │ (with        │ │
+│ │  appOwner    │ │                    │ │  appOwner    │ │
+│ │  labels)     │ │                    │ │  labels)     │ │
+│ └──────────────┘ │                    │ └──────────────┘ │
+└──────────────────┘                    └──────────────────┘
 ```
 
 ## Function Call Flow

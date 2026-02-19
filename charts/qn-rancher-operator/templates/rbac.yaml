@@ -26,6 +26,14 @@ rules:
   - watch
   - create
 - apiGroups:
+  - management.cattle.io
+  resources:
+  - clusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases

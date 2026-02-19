@@ -40,6 +40,7 @@ type NamespaceReconciler struct {
 
 //+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=management.cattle.io,resources=projects,verbs=get;list;watch;create
+//+kubebuilder:rbac:groups=management.cattle.io,resources=clusters,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -360,6 +361,44 @@ func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) 
 		}
 	}
 
+	// Try to find a project in the "local" namespace (management cluster)
+	// The management cluster uses "local" as its cluster ID/namespace
+	localProject := &unstructured.Unstructured{}
+	localProject.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "Project",
+	})
+	
+	// Try to list projects in the "local" namespace
+	localProjectList := &unstructured.UnstructuredList{}
+	localProjectList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "ProjectList",
+	})
+	
+	if err := r.List(ctx, localProjectList, client.InNamespace("local"), client.Limit(1)); err == nil && len(localProjectList.Items) > 0 {
+		logger.Info("found cluster ID from local namespace projects", "clusterId", "local")
+		return "local", nil
+	}
+	
+	// Try to get cluster ID from the local cluster resource
+	// The management cluster is typically named "local"
+	cluster := &unstructured.Unstructured{}
+	cluster.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "Cluster",
+	})
+	
+	// Try to get the "local" cluster (management cluster)
+	if err := r.Get(ctx, client.ObjectKey{Name: "local"}, cluster); err == nil {
+		// For the management cluster, use "local" as the cluster ID
+		logger.Info("found local cluster, using 'local' as cluster ID", "clusterId", "local")
+		return "local", nil
+	}
+	
 	// Try to get cluster ID from the current namespace (if controller is in a namespace with cluster label)
 	// This is a fallback - in practice, you might want to configure this via environment variable or config
 	return "", fmt.Errorf("unable to determine cluster ID from existing resources")

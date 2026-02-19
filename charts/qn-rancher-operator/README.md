@@ -2,11 +2,18 @@
 
 This Helm chart deploys the QN Rancher Operator controller to your Kubernetes cluster.
 
+## ⚠️ Important: Deployment Location
+
+**This operator MUST be deployed on the Rancher management cluster** (where Rancher itself is running), **NOT** on downstream clusters that have the Rancher agent (cattle) installed.
+
+The operator requires access to Rancher's management API (`management.cattle.io/v3`), which is only available on the management cluster. It uses this API to manage namespaces and projects across all clusters registered with Rancher.
+
 ## Prerequisites
 
+- **Rancher management cluster** (where Rancher is deployed)
 - Kubernetes 1.19+
 - Helm 3.0+
-- Access to Rancher's management API (management.cattle.io/v3)
+- Access to Rancher's management API (management.cattle.io/v3) - only available on management cluster
 - RBAC permissions to create ClusterRole and ClusterRoleBinding
 
 ## Installation
@@ -20,8 +27,10 @@ helm repo update
 
 ### Install the chart
 
+**Deploy on the Rancher management cluster:**
+
 ```bash
-# Install with default values
+# Install with default values (on management cluster)
 helm install qn-rancher-operator ./charts/qn-rancher-operator
 
 # Install with custom values
