@@ -313,10 +313,47 @@ func (r *NamespaceReconciler) createProject(ctx context.Context, projectName str
 }
 
 // getClusterID attempts to determine the cluster ID from existing resources
+// Since we're running on the management cluster, namespaces we process are on the management cluster
+// The management cluster uses "local" as its cluster ID
 func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) {
 	logger := log.FromContext(ctx)
 
-	// Try to get cluster ID from an existing project
+	// First, try to find a project in the "local" namespace (management cluster)
+	// The management cluster uses "local" as its cluster ID/namespace
+	localProjectList := &unstructured.UnstructuredList{}
+	localProjectList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "ProjectList",
+	})
+	
+	if err := r.List(ctx, localProjectList, client.InNamespace("local"), client.Limit(1)); err == nil && len(localProjectList.Items) > 0 {
+		logger.Info("found cluster ID from local namespace projects", "clusterId", "local")
+		return "local", nil
+	} else if err != nil {
+		logger.V(1).Info("error listing projects in local namespace", "error", err)
+	}
+
+	// Try to get cluster ID from the local cluster resource
+	// The management cluster is typically named "local"
+	cluster := &unstructured.Unstructured{}
+	cluster.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "Cluster",
+	})
+	
+	// Try to get the "local" cluster (management cluster)
+	if err := r.Get(ctx, client.ObjectKey{Name: "local"}, cluster); err == nil {
+		// For the management cluster, use "local" as the cluster ID
+		logger.Info("found local cluster, using 'local' as cluster ID", "clusterId", "local")
+		return "local", nil
+	} else {
+		logger.V(1).Info("error getting local cluster", "error", err)
+	}
+
+	// Fallback: Try to get cluster ID from any existing project (for downstream clusters)
+	// This should rarely be needed since we're on the management cluster
 	projectList := &unstructured.UnstructuredList{}
 	projectList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "management.cattle.io",
@@ -334,13 +371,13 @@ func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) 
 		logger.V(1).Info("checking project for cluster ID", "projectName", projectName, "namespace", clusterID, "fullName", project.GetName())
 		
 		if clusterID != "" {
-			logger.Info("found cluster ID from existing project namespace", "clusterId", clusterID, "projectName", projectName)
+			logger.Info("found cluster ID from existing project namespace (fallback)", "clusterId", clusterID, "projectName", projectName)
 			return clusterID, nil
 		}
 		// Fallback: try to extract from project name (format: c-xxxxx:p-xxxxx) if namespace is empty
 		clusterID = r.extractClusterID(projectName)
 		if clusterID != "" {
-			logger.Info("found cluster ID from existing project name", "clusterId", clusterID, "projectName", projectName)
+			logger.Info("found cluster ID from existing project name (fallback)", "clusterId", clusterID, "projectName", projectName)
 			return clusterID, nil
 		}
 		logger.V(1).Info("project found but could not extract cluster ID", "projectName", projectName, "namespace", project.GetNamespace())
@@ -361,43 +398,6 @@ func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) 
 		}
 	}
 
-	// Try to find a project in the "local" namespace (management cluster)
-	// The management cluster uses "local" as its cluster ID/namespace
-	localProject := &unstructured.Unstructured{}
-	localProject.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "Project",
-	})
-	
-	// Try to list projects in the "local" namespace
-	localProjectList := &unstructured.UnstructuredList{}
-	localProjectList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "ProjectList",
-	})
-	
-	if err := r.List(ctx, localProjectList, client.InNamespace("local"), client.Limit(1)); err == nil && len(localProjectList.Items) > 0 {
-		logger.Info("found cluster ID from local namespace projects", "clusterId", "local")
-		return "local", nil
-	}
-	
-	// Try to get cluster ID from the local cluster resource
-	// The management cluster is typically named "local"
-	cluster := &unstructured.Unstructured{}
-	cluster.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "Cluster",
-	})
-	
-	// Try to get the "local" cluster (management cluster)
-	if err := r.Get(ctx, client.ObjectKey{Name: "local"}, cluster); err == nil {
-		// For the management cluster, use "local" as the cluster ID
-		logger.Info("found local cluster, using 'local' as cluster ID", "clusterId", "local")
-		return "local", nil
-	}
 	
 	// Try to get cluster ID from the current namespace (if controller is in a namespace with cluster label)
 	// This is a fallback - in practice, you might want to configure this via environment variable or config
