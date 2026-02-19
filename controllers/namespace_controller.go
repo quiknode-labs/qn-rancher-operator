@@ -3,17 +3,21 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
 const (
@@ -30,16 +34,25 @@ const (
 	// The operator MUST be deployed on the management cluster, not on downstream clusters.
 	rancherProjectAPIVersion = "management.cattle.io/v3"
 	rancherProjectKind       = "Project"
+	rancherClusterAPIVersion = "management.cattle.io/v3"
+	rancherClusterKind       = "Cluster"
+
+	// Cluster refresh interval
+	clusterRefreshInterval = 5 * time.Minute
 )
 
 // NamespaceReconciler reconciles a Namespace object
 type NamespaceReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme        *runtime.Scheme
+	Manager       manager.Manager
+	clusterClients map[string]client.Client
+	clusterMutex   sync.RWMutex
+	lastClusterRefresh time.Time
 }
 
 //+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=management.cattle.io,resources=projects,verbs=get;list;watch;create
+//+kubebuilder:rbac:groups=management.cattle.io,resources=projects,verbs=get;list;watch
 //+kubebuilder:rbac:groups=management.cattle.io,resources=clusters,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -47,83 +60,226 @@ type NamespaceReconciler struct {
 func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the Namespace instance
+	// Determine which cluster this namespace belongs to from the request
+	// The request may contain cluster information in the namespace field or we need to detect it
+	clusterID, namespaceClient := r.getClusterClient(ctx, req)
+	if namespaceClient == nil {
+		logger.V(1).Info("no cluster client available, using management cluster client", "namespace", req.Name)
+		namespaceClient = r.Client
+		clusterID = "local"
+	}
+
+	// Fetch the Namespace instance from the appropriate cluster
 	namespace := &corev1.Namespace{}
-	if err := r.Get(ctx, req.NamespacedName, namespace); err != nil {
+	if err := namespaceClient.Get(ctx, types.NamespacedName{Name: req.Name}, namespace); err != nil {
 		if errors.IsNotFound(err) {
 			// Namespace was deleted, nothing to do
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "unable to fetch Namespace")
+		logger.Error(err, "unable to fetch Namespace", "clusterId", clusterID)
 		return ctrl.Result{}, err
 	}
 
 	// Check if namespace has appOwner label
 	appOwner, exists := namespace.Labels[appOwnerLabel]
 	if !exists || appOwner == "" {
-		logger.V(1).Info("namespace does not have appOwner label, skipping", "namespace", namespace.Name)
+		logger.V(1).Info("namespace does not have appOwner label, skipping", "namespace", namespace.Name, "clusterId", clusterID)
 		return ctrl.Result{}, nil
 	}
 
 	// Check if namespace is already assigned to a project
 	if projectID, hasProject := namespace.Labels[rancherProjectIDLabel]; hasProject && projectID != "" {
-		logger.V(1).Info("namespace already assigned to project", "namespace", namespace.Name, "projectId", projectID)
+		logger.V(1).Info("namespace already assigned to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", clusterID)
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("processing namespace with appOwner label", "namespace", namespace.Name, "appOwner", appOwner)
+	logger.Info("processing namespace with appOwner label", "namespace", namespace.Name, "appOwner", appOwner, "clusterId", clusterID)
 
 	// Find the Rancher Project by name (case-insensitive)
-	project, err := r.findProjectByName(ctx, appOwner)
+	// Projects are managed on the management cluster, so use the management client
+	project, err := r.findProjectByName(ctx, appOwner, clusterID)
 	if err != nil {
-		logger.Error(err, "unable to find project", "projectName", appOwner)
+		logger.Error(err, "unable to find project", "projectName", appOwner, "clusterId", clusterID)
 		return ctrl.Result{}, err
 	}
 
-	// If project doesn't exist, create it
+	// If project doesn't exist, skip (project creation removed)
 	if project == nil {
-		logger.Info("project not found, creating new project", "projectName", appOwner, "namespace", namespace.Name)
-		project, err = r.createProject(ctx, appOwner)
-		if err != nil {
-			logger.Error(err, "unable to create project", "projectName", appOwner)
-			return ctrl.Result{}, err
-		}
-		logger.Info("successfully created project", "projectName", appOwner, "projectId", project.GetName())
+		logger.Info("project not found, skipping namespace assignment", "projectName", appOwner, "namespace", namespace.Name, "clusterId", clusterID)
+		return ctrl.Result{}, nil
 	}
 
 	// Get project ID and cluster ID from the project
 	projectID := project.GetName()
-	clusterID := r.extractClusterID(projectID)
+	projectClusterID := r.extractClusterID(projectID)
+
+	// Use the project's cluster ID if available, otherwise use the detected cluster ID
+	if projectClusterID == "" {
+		projectClusterID = clusterID
+	}
 
 	if projectID == "" {
-		logger.Info("project ID is empty, skipping", "projectName", appOwner)
+		logger.Info("project ID is empty, skipping", "projectName", appOwner, "clusterId", clusterID)
 		return ctrl.Result{}, nil
 	}
 
-	// Update namespace with project labels and annotations
-	if err := r.updateNamespaceWithProject(ctx, namespace, projectID, clusterID); err != nil {
-		logger.Error(err, "unable to update namespace with project assignment", "namespace", namespace.Name)
+	// Update namespace with project labels and annotations using the appropriate cluster client
+	if err := r.updateNamespaceWithProject(ctx, namespaceClient, namespace, projectID, projectClusterID); err != nil {
+		logger.Error(err, "unable to update namespace with project assignment", "namespace", namespace.Name, "clusterId", clusterID)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("successfully assigned namespace to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", clusterID)
+	logger.Info("successfully assigned namespace to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", projectClusterID)
 	return ctrl.Result{}, nil
 }
 
+// getClusterClient determines which cluster client to use based on the request
+// Returns the cluster ID and the appropriate client
+// For now, we primarily watch the management cluster. Downstream cluster access
+// will be handled through Rancher's cluster proxy when needed.
+func (r *NamespaceReconciler) getClusterClient(ctx context.Context, req ctrl.Request) (string, client.Client) {
+	r.clusterMutex.RLock()
+	defer r.clusterMutex.RUnlock()
+
+	// For now, we're watching the management cluster directly
+	// In the future, we can enhance this to detect which cluster the namespace belongs to
+	// by checking namespace labels or using Rancher's cluster mapping
+	return "local", r.Client
+}
+
+// refreshClusterClients periodically refreshes the list of downstream clusters and creates clients
+func (r *NamespaceReconciler) refreshClusterClients(ctx context.Context) {
+	ticker := time.NewTicker(clusterRefreshInterval)
+	defer ticker.Stop()
+
+	// Initial refresh
+	r.doRefreshClusterClients(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.doRefreshClusterClients(ctx)
+		}
+	}
+}
+
+func (r *NamespaceReconciler) doRefreshClusterClients(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	logger.Info("refreshing cluster clients")
+
+	// List all clusters from Rancher
+	clusterList := &unstructured.UnstructuredList{}
+	clusterList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Version: "v3",
+		Kind:    "ClusterList",
+	})
+
+	if err := r.List(ctx, clusterList); err != nil {
+		logger.Error(err, "unable to list clusters")
+		return
+	}
+
+	newClusterClients := make(map[string]client.Client)
+
+	// Create clients for each cluster
+	for i := range clusterList.Items {
+		cluster := &clusterList.Items[i]
+		clusterID := cluster.GetName()
+		
+		// Skip the local cluster (management cluster) - we already have a client for it
+		if clusterID == "local" {
+			continue
+		}
+
+		// Get cluster status to check if it's ready
+		status, found, err := unstructured.NestedMap(cluster.Object, "status")
+		if err != nil || !found {
+			logger.V(1).Info("cluster status not found, skipping", "clusterId", clusterID)
+			continue
+		}
+
+		// Check if cluster is ready
+		conditions, found, _ := unstructured.NestedSlice(status, "conditions")
+		if !found {
+			logger.V(1).Info("cluster conditions not found, skipping", "clusterId", clusterID)
+			continue
+		}
+
+		ready := false
+		for _, cond := range conditions {
+			if condMap, ok := cond.(map[string]interface{}); ok {
+				if condType, ok := condMap["type"].(string); ok && condType == "Ready" {
+					if condStatus, ok := condMap["status"].(string); ok && condStatus == "True" {
+						ready = true
+						break
+					}
+				}
+			}
+		}
+
+		if !ready {
+			logger.V(1).Info("cluster not ready, skipping", "clusterId", clusterID)
+			continue
+		}
+
+		// Create a client for this cluster using Rancher's cluster proxy
+		clusterClient, err := r.createClusterClient(ctx, clusterID)
+		if err != nil {
+			logger.Error(err, "unable to create client for cluster", "clusterId", clusterID)
+			continue
+		}
+
+		newClusterClients[clusterID] = clusterClient
+		logger.Info("created client for cluster", "clusterId", clusterID)
+	}
+
+	// Update cluster clients map
+	r.clusterMutex.Lock()
+	r.clusterClients = newClusterClients
+	r.lastClusterRefresh = time.Now()
+	r.clusterMutex.Unlock()
+
+	logger.Info("cluster clients refreshed", "clusterCount", len(newClusterClients))
+}
+
+// createClusterClient creates a Kubernetes client for a downstream cluster using Rancher's cluster proxy
+func (r *NamespaceReconciler) createClusterClient(ctx context.Context, clusterID string) (client.Client, error) {
+	// Get the base REST config from the manager
+	config := r.Manager.GetConfig()
+
+	// Create a new config for the cluster proxy
+	clusterConfig := rest.CopyConfig(config)
+	
+	// Rancher's cluster proxy URL format: /k8s/clusters/<cluster-id>
+	// We need to modify the API path to include the cluster ID
+	// The cluster proxy is accessed through the management cluster's API server
+	if clusterConfig.Host != "" {
+		// Ensure the host ends with the cluster proxy path
+		if !strings.Contains(clusterConfig.Host, "/k8s/clusters/") {
+			// Insert cluster proxy path before any existing path
+			clusterConfig.Host = strings.TrimSuffix(clusterConfig.Host, "/") + "/k8s/clusters/" + clusterID
+		}
+	}
+
+	// Create a new client for this cluster
+	clusterClient, err := client.New(clusterConfig, client.Options{Scheme: r.Scheme})
+	if err != nil {
+		return nil, fmt.Errorf("unable to create client for cluster %s: %w", clusterID, err)
+	}
+
+	return clusterClient, nil
+}
+
 // findProjectByName searches for a Rancher Project by its display name
-func (r *NamespaceReconciler) findProjectByName(ctx context.Context, projectName string) (client.Object, error) {
+func (r *NamespaceReconciler) findProjectByName(ctx context.Context, projectName string, clusterID string) (client.Object, error) {
 	logger := log.FromContext(ctx)
 
-	// Rancher Projects are stored as custom resources in the management.cattle.io/v3 API
-	// Projects are typically named in the format: <cluster-id>:<project-id>
-	// The display name is stored in spec.displayName
+	logger.V(1).Info("searching for project", "projectName", projectName, "clusterId", clusterID)
 
-	logger.V(1).Info("searching for project", "projectName", projectName)
-
-	// Note: Label-based search is case-sensitive in Kubernetes, so we'll rely on
-	// the full list search with case-insensitive matching instead
-
-	// If label search fails, list all projects and match by displayName
+	// List all projects, optionally filtered by cluster
 	projectList := &unstructured.UnstructuredList{}
 	projectList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "management.cattle.io",
@@ -131,8 +287,14 @@ func (r *NamespaceReconciler) findProjectByName(ctx context.Context, projectName
 		Kind:    "ProjectList",
 	})
 
-	if err := r.List(ctx, projectList); err != nil {
-		logger.V(1).Info("unable to list projects, may need to configure Rancher API access", "error", err)
+	var listOptions []client.ListOption
+	if clusterID != "" && clusterID != "local" {
+		// Filter by cluster namespace if specified
+		listOptions = append(listOptions, client.InNamespace(clusterID))
+	}
+
+	if err := r.List(ctx, projectList, listOptions...); err != nil {
+		logger.V(1).Info("unable to list projects", "error", err)
 		return nil, fmt.Errorf("unable to list projects: %w", err)
 	}
 
@@ -140,7 +302,7 @@ func (r *NamespaceReconciler) findProjectByName(ctx context.Context, projectName
 	for i := range projectList.Items {
 		project := &projectList.Items[i]
 		if r.projectMatches(project, projectName) {
-			logger.Info("found project by name match", "projectName", projectName, "projectId", project.GetName())
+			logger.Info("found project by name match", "projectName", projectName, "projectId", project.GetName(), "clusterId", clusterID)
 			return project, nil
 		}
 	}
@@ -148,7 +310,7 @@ func (r *NamespaceReconciler) findProjectByName(ctx context.Context, projectName
 	return nil, nil
 }
 
-// projectMatches checks if a project matches the given name
+// projectMatches checks if a project matches the given name (case-insensitive)
 func (r *NamespaceReconciler) projectMatches(project *unstructured.Unstructured, projectName string) bool {
 	// First, check spec.displayName (most common location for project display name)
 	if displayName, found, err := unstructured.NestedString(project.Object, "spec", "displayName"); err == nil && found {
@@ -188,42 +350,6 @@ func (r *NamespaceReconciler) projectMatches(project *unstructured.Unstructured,
 	return false
 }
 
-// sanitizeProjectID converts a project display name to a valid project ID
-// Rancher project IDs are typically in format: p-xxxxx
-func (r *NamespaceReconciler) sanitizeProjectID(projectName string) string {
-	// Convert to lowercase
-	id := strings.ToLower(projectName)
-
-	// Replace spaces and common separators with hyphens
-	id = strings.ReplaceAll(id, " ", "-")
-	id = strings.ReplaceAll(id, "_", "-")
-	id = strings.ReplaceAll(id, ".", "-")
-
-	// Remove any characters that aren't alphanumeric or hyphens
-	reg := regexp.MustCompile("[^a-z0-9-]")
-	id = reg.ReplaceAllString(id, "")
-
-	// Remove consecutive hyphens
-	reg = regexp.MustCompile("-+")
-	id = reg.ReplaceAllString(id, "-")
-
-	// Remove leading/trailing hyphens
-	id = strings.Trim(id, "-")
-
-	// Ensure it starts with "p-"
-	if !strings.HasPrefix(id, "p-") {
-		id = "p-" + id
-	}
-
-	// Limit length (Kubernetes names have a 253 char limit, but project IDs are typically shorter)
-	if len(id) > 63 {
-		id = id[:63]
-		id = strings.TrimSuffix(id, "-")
-	}
-
-	return id
-}
-
 // extractClusterID extracts cluster ID from project ID
 // Rancher project IDs are typically in format: c-xxxxx:p-xxxxx
 func (r *NamespaceReconciler) extractClusterID(projectID string) string {
@@ -234,180 +360,8 @@ func (r *NamespaceReconciler) extractClusterID(projectID string) string {
 	return ""
 }
 
-// createProject creates a new Rancher Project with the given display name
-func (r *NamespaceReconciler) createProject(ctx context.Context, projectName string) (client.Object, error) {
-	logger := log.FromContext(ctx)
-
-	// First, we need to get the cluster ID
-	// Try to get it from an existing project or namespace
-	clusterID, err := r.getClusterID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to determine cluster ID: %w", err)
-	}
-
-	if clusterID == "" {
-		return nil, fmt.Errorf("cluster ID is empty, cannot create project")
-	}
-
-	// Create a new Project resource
-	project := &unstructured.Unstructured{}
-	project.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "Project",
-	})
-
-	// Rancher projects are named as <cluster-id>:<project-id>
-	// Generate a project ID from the project name (sanitized for Kubernetes naming)
-	projectID := r.sanitizeProjectID(projectName)
-	projectNameFull := clusterID + ":" + projectID
-
-	// Check if a project with this name already exists (might have been created by another process)
-	existingProject := &unstructured.Unstructured{}
-	existingProject.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "Project",
-	})
-
-	if err := r.Get(ctx, client.ObjectKey{Name: projectNameFull}, existingProject); err == nil {
-		// Project already exists, return it
-		logger.Info("project already exists with generated ID", "projectName", projectName, "projectId", projectNameFull)
-		return existingProject, nil
-	} else if !errors.IsNotFound(err) {
-		// Some other error occurred
-		return nil, fmt.Errorf("unable to check for existing project: %w", err)
-	}
-
-	// Project doesn't exist, create it
-	// Projects are namespaced resources, so we need to set both name and namespace
-	project.SetName(projectNameFull)
-	project.SetNamespace(clusterID) // Set the namespace to the cluster ID
-
-	// Set labels
-	project.SetLabels(map[string]string{
-		"field.cattle.io/projectName": projectName,
-	})
-
-	// Set annotations
-	project.SetAnnotations(map[string]string{
-		"field.cattle.io/projectName": projectName,
-	})
-
-	// Set the spec with displayName
-	if err := unstructured.SetNestedField(project.Object, projectName, "spec", "displayName"); err != nil {
-		return nil, fmt.Errorf("unable to set displayName: %w", err)
-	}
-
-	// Set clusterName in spec (this tells Rancher which cluster this project belongs to)
-	if err := unstructured.SetNestedField(project.Object, clusterID, "spec", "clusterName"); err != nil {
-		return nil, fmt.Errorf("unable to set clusterName: %w", err)
-	}
-
-	// Create the project
-	if err := r.Create(ctx, project); err != nil {
-		logger.Error(err, "unable to create project", "projectName", projectName, "clusterId", clusterID)
-		return nil, fmt.Errorf("unable to create project: %w", err)
-	}
-
-	logger.Info("created new project", "projectName", projectName, "projectId", project.GetName(), "clusterId", clusterID)
-	return project, nil
-}
-
-// getClusterID attempts to determine the cluster ID from existing resources
-// Since we're running on the management cluster, namespaces we process are on the management cluster
-// The management cluster uses "local" as its cluster ID
-func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) {
-	logger := log.FromContext(ctx)
-
-	// First, try to find a project in the "local" namespace (management cluster)
-	// The management cluster uses "local" as its cluster ID/namespace
-	localProjectList := &unstructured.UnstructuredList{}
-	localProjectList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "ProjectList",
-	})
-	
-	if err := r.List(ctx, localProjectList, client.InNamespace("local"), client.Limit(1)); err == nil && len(localProjectList.Items) > 0 {
-		logger.Info("found cluster ID from local namespace projects", "clusterId", "local")
-		return "local", nil
-	} else if err != nil {
-		logger.V(1).Info("error listing projects in local namespace", "error", err)
-	}
-
-	// Try to get cluster ID from the local cluster resource
-	// The management cluster is typically named "local"
-	cluster := &unstructured.Unstructured{}
-	cluster.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "Cluster",
-	})
-	
-	// Try to get the "local" cluster (management cluster)
-	if err := r.Get(ctx, client.ObjectKey{Name: "local"}, cluster); err == nil {
-		// For the management cluster, use "local" as the cluster ID
-		logger.Info("found local cluster, using 'local' as cluster ID", "clusterId", "local")
-		return "local", nil
-	} else {
-		logger.V(1).Info("error getting local cluster", "error", err)
-	}
-
-	// Fallback: Try to get cluster ID from any existing project (for downstream clusters)
-	// This should rarely be needed since we're on the management cluster
-	projectList := &unstructured.UnstructuredList{}
-	projectList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "management.cattle.io",
-		Version: "v3",
-		Kind:    "ProjectList",
-	})
-
-	if err := r.List(ctx, projectList, client.Limit(1)); err == nil && len(projectList.Items) > 0 {
-		// Extract cluster ID from existing project namespace (projects are namespaced, namespace = cluster ID)
-		// Projects are stored in namespaces like "c-xxxxx" where the namespace IS the cluster ID
-		project := projectList.Items[0]
-		clusterID := project.GetNamespace()
-		projectName := project.GetName()
-		
-		logger.V(1).Info("checking project for cluster ID", "projectName", projectName, "namespace", clusterID, "fullName", project.GetName())
-		
-		if clusterID != "" {
-			logger.Info("found cluster ID from existing project namespace (fallback)", "clusterId", clusterID, "projectName", projectName)
-			return clusterID, nil
-		}
-		// Fallback: try to extract from project name (format: c-xxxxx:p-xxxxx) if namespace is empty
-		clusterID = r.extractClusterID(projectName)
-		if clusterID != "" {
-			logger.Info("found cluster ID from existing project name (fallback)", "clusterId", clusterID, "projectName", projectName)
-			return clusterID, nil
-		}
-		logger.V(1).Info("project found but could not extract cluster ID", "projectName", projectName, "namespace", project.GetNamespace())
-	} else if err != nil {
-		logger.Error(err, "error listing projects to determine cluster ID")
-	} else {
-		logger.V(1).Info("no projects found to determine cluster ID")
-	}
-
-	// Try to get cluster ID from a namespace with project assignment
-	namespaceList := &corev1.NamespaceList{}
-	if err := r.List(ctx, namespaceList, client.Limit(10)); err == nil {
-		for _, ns := range namespaceList.Items {
-			if clusterID, ok := ns.Labels[rancherClusterIDLabel]; ok && clusterID != "" {
-				logger.V(1).Info("found cluster ID from namespace", "clusterId", clusterID)
-				return clusterID, nil
-			}
-		}
-	}
-
-	
-	// Try to get cluster ID from the current namespace (if controller is in a namespace with cluster label)
-	// This is a fallback - in practice, you might want to configure this via environment variable or config
-	return "", fmt.Errorf("unable to determine cluster ID from existing resources")
-}
-
 // updateNamespaceWithProject updates the namespace with project assignment labels and annotations
-func (r *NamespaceReconciler) updateNamespaceWithProject(ctx context.Context, namespace *corev1.Namespace, projectID, clusterID string) error {
+func (r *NamespaceReconciler) updateNamespaceWithProject(ctx context.Context, namespaceClient client.Client, namespace *corev1.Namespace, projectID, clusterID string) error {
 	logger := log.FromContext(ctx)
 
 	// Create a patch for the namespace
@@ -428,9 +382,9 @@ func (r *NamespaceReconciler) updateNamespaceWithProject(ctx context.Context, na
 	}
 	namespace.Annotations[rancherProjectIDAnnotation] = projectID
 
-	// Apply the patch
-	if err := r.Patch(ctx, namespace, patch); err != nil {
-		logger.Error(err, "unable to patch namespace", "namespace", namespace.Name)
+	// Apply the patch using the appropriate cluster client
+	if err := namespaceClient.Patch(ctx, namespace, patch); err != nil {
+		logger.Error(err, "unable to patch namespace", "namespace", namespace.Name, "clusterId", clusterID)
 		return err
 	}
 
@@ -439,7 +393,20 @@ func (r *NamespaceReconciler) updateNamespaceWithProject(ctx context.Context, na
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NamespaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Namespace{}).
-		Complete(r)
+	r.Manager = mgr
+	r.clusterClients = make(map[string]client.Client)
+	r.lastClusterRefresh = time.Time{}
+
+	// Start background goroutine to refresh cluster clients
+	ctx := context.Background()
+	go r.refreshClusterClients(ctx)
+
+	// Set up controller for management cluster namespaces
+	// Note: For downstream clusters, we'll need to access them via Rancher's cluster proxy
+	// The reconcile function will determine which cluster a namespace belongs to
+	// and use the appropriate client
+	builder := ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Namespace{})
+
+	return builder.Complete(r)
 }
