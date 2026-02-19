@@ -280,7 +280,9 @@ func (r *NamespaceReconciler) createProject(ctx context.Context, projectName str
 	}
 
 	// Project doesn't exist, create it
+	// Projects are namespaced resources, so we need to set both name and namespace
 	project.SetName(projectNameFull)
+	project.SetNamespace(clusterID) // Set the namespace to the cluster ID
 
 	// Set labels
 	project.SetLabels(map[string]string{
