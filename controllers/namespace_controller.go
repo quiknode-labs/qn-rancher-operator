@@ -326,18 +326,27 @@ func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) 
 	if err := r.List(ctx, projectList, client.Limit(1)); err == nil && len(projectList.Items) > 0 {
 		// Extract cluster ID from existing project namespace (projects are namespaced, namespace = cluster ID)
 		// Projects are stored in namespaces like "c-xxxxx" where the namespace IS the cluster ID
-		clusterID := projectList.Items[0].GetNamespace()
+		project := projectList.Items[0]
+		clusterID := project.GetNamespace()
+		projectName := project.GetName()
+		
+		logger.V(1).Info("checking project for cluster ID", "projectName", projectName, "namespace", clusterID, "fullName", project.GetName())
+		
 		if clusterID != "" {
-			logger.V(1).Info("found cluster ID from existing project namespace", "clusterId", clusterID)
+			logger.Info("found cluster ID from existing project namespace", "clusterId", clusterID, "projectName", projectName)
 			return clusterID, nil
 		}
 		// Fallback: try to extract from project name (format: c-xxxxx:p-xxxxx) if namespace is empty
-		projectID := projectList.Items[0].GetName()
-		clusterID = r.extractClusterID(projectID)
+		clusterID = r.extractClusterID(projectName)
 		if clusterID != "" {
-			logger.V(1).Info("found cluster ID from existing project name", "clusterId", clusterID)
+			logger.Info("found cluster ID from existing project name", "clusterId", clusterID, "projectName", projectName)
 			return clusterID, nil
 		}
+		logger.V(1).Info("project found but could not extract cluster ID", "projectName", projectName, "namespace", project.GetNamespace())
+	} else if err != nil {
+		logger.Error(err, "error listing projects to determine cluster ID")
+	} else {
+		logger.V(1).Info("no projects found to determine cluster ID")
 	}
 
 	// Try to get cluster ID from a namespace with project assignment
