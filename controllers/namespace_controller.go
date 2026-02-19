@@ -26,6 +26,8 @@ const (
 	appOwnerLabel = "appOwner"
 
 	// Rancher Project resource
+	// NOTE: This API is only available on the Rancher management cluster.
+	// The operator MUST be deployed on the management cluster, not on downstream clusters.
 	rancherProjectAPIVersion = "management.cattle.io/v3"
 	rancherProjectKind       = "Project"
 )
@@ -322,11 +324,18 @@ func (r *NamespaceReconciler) getClusterID(ctx context.Context) (string, error) 
 	})
 
 	if err := r.List(ctx, projectList, client.Limit(1)); err == nil && len(projectList.Items) > 0 {
-		// Extract cluster ID from existing project name (format: c-xxxxx:p-xxxxx)
-		projectID := projectList.Items[0].GetName()
-		clusterID := r.extractClusterID(projectID)
+		// Extract cluster ID from existing project namespace (projects are namespaced, namespace = cluster ID)
+		// Projects are stored in namespaces like "c-xxxxx" where the namespace IS the cluster ID
+		clusterID := projectList.Items[0].GetNamespace()
 		if clusterID != "" {
-			logger.V(1).Info("found cluster ID from existing project", "clusterId", clusterID)
+			logger.V(1).Info("found cluster ID from existing project namespace", "clusterId", clusterID)
+			return clusterID, nil
+		}
+		// Fallback: try to extract from project name (format: c-xxxxx:p-xxxxx) if namespace is empty
+		projectID := projectList.Items[0].GetName()
+		clusterID = r.extractClusterID(projectID)
+		if clusterID != "" {
+			logger.V(1).Info("found cluster ID from existing project name", "clusterId", clusterID)
 			return clusterID, nil
 		}
 	}
