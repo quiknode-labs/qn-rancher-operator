@@ -44,10 +44,10 @@ const (
 // NamespaceReconciler reconciles a Namespace object
 type NamespaceReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Manager       manager.Manager
-	clusterClients map[string]client.Client
-	clusterMutex   sync.RWMutex
+	Scheme             *runtime.Scheme
+	Manager            manager.Manager
+	clusterClients     map[string]client.Client
+	clusterMutex       sync.RWMutex
 	lastClusterRefresh time.Time
 }
 
@@ -188,7 +188,7 @@ func (r *NamespaceReconciler) doRefreshClusterClients(ctx context.Context) {
 	for i := range clusterList.Items {
 		cluster := &clusterList.Items[i]
 		clusterID := cluster.GetName()
-		
+
 		// Skip the local cluster (management cluster) - we already have a client for it
 		if clusterID == "local" {
 			continue
@@ -252,7 +252,7 @@ func (r *NamespaceReconciler) createClusterClient(ctx context.Context, clusterID
 
 	// Create a new config for the cluster proxy
 	clusterConfig := rest.CopyConfig(config)
-	
+
 	// Rancher's cluster proxy URL format: /k8s/clusters/<cluster-id>
 	// We need to modify the API path to include the cluster ID
 	// The cluster proxy is accessed through the management cluster's API server
