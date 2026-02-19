@@ -1,0 +1,18 @@
+apiVersion: v2
+name: qn-rancher-operator
+description: A Helm chart for QN Rancher Operator - automatically assigns namespaces to Rancher Projects based on appOwner label
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - rancher
+  - kubernetes
+  - operator
+  - controller
+  - namespace
+  - project
+maintainers:
+  - name: QN Team
+home: https://github.com/quiknode-labs/qn-rancher-operator
+sources:
+  - https://github.com/quiknode-labs/qn-rancher-operator
