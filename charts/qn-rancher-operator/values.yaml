@@ -7,7 +7,7 @@ image:
   repository: ghcr.io/quiknode-labs/qn-rancher-operator
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
+  tag: "latest"
 
 imagePullSecrets: []
 nameOverride: ""
