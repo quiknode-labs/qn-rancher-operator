@@ -87,12 +87,6 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	// Check if namespace is already assigned to a project
-	if projectID, hasProject := namespace.Labels[rancherProjectIDLabel]; hasProject && projectID != "" {
-		logger.V(1).Info("namespace already assigned to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", clusterID)
-		return ctrl.Result{}, nil
-	}
-
 	logger.Info("processing namespace with appOwner label", "namespace", namespace.Name, "appOwner", appOwner, "clusterId", clusterID)
 
 	// Find the Rancher Project by name (case-insensitive)
@@ -121,6 +115,21 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if projectID == "" {
 		logger.Info("project ID is empty, skipping", "projectName", appOwner, "clusterId", clusterID)
 		return ctrl.Result{}, nil
+	}
+
+	// Check if namespace is already correctly assigned to this project
+	if existingProjectID, hasProject := namespace.Labels[rancherProjectIDLabel]; hasProject && existingProjectID == projectID {
+		// Also check if cluster ID matches (if present)
+		if existingClusterID, hasClusterID := namespace.Labels[rancherClusterIDLabel]; hasClusterID {
+			if existingClusterID == projectClusterID {
+				logger.V(1).Info("namespace already correctly assigned to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", projectClusterID)
+				return ctrl.Result{}, nil
+			}
+		} else if projectClusterID == clusterID {
+			// If no cluster ID label but the project cluster matches detected cluster, consider it correct
+			logger.V(1).Info("namespace already correctly assigned to project", "namespace", namespace.Name, "projectId", projectID, "clusterId", projectClusterID)
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Update namespace with project labels and annotations using the appropriate cluster client
@@ -361,8 +370,35 @@ func (r *NamespaceReconciler) extractClusterID(projectID string) string {
 }
 
 // updateNamespaceWithProject updates the namespace with project assignment labels and annotations
+// Only updates if the values are different to avoid unnecessary patches
 func (r *NamespaceReconciler) updateNamespaceWithProject(ctx context.Context, namespaceClient client.Client, namespace *corev1.Namespace, projectID, clusterID string) error {
 	logger := log.FromContext(ctx)
+
+	// Check if update is needed
+	needsUpdate := false
+
+	// Check if project ID label needs updating
+	if existingProjectID, exists := namespace.Labels[rancherProjectIDLabel]; !exists || existingProjectID != projectID {
+		needsUpdate = true
+	}
+
+	// Check if cluster ID label needs updating
+	if clusterID != "" {
+		if existingClusterID, exists := namespace.Labels[rancherClusterIDLabel]; !exists || existingClusterID != clusterID {
+			needsUpdate = true
+		}
+	}
+
+	// Check if annotation needs updating
+	if existingProjectAnnotation, exists := namespace.Annotations[rancherProjectIDAnnotation]; !exists || existingProjectAnnotation != projectID {
+		needsUpdate = true
+	}
+
+	// If no update needed, skip
+	if !needsUpdate {
+		logger.V(1).Info("namespace already has correct project assignment, skipping update", "namespace", namespace.Name, "projectId", projectID, "clusterId", clusterID)
+		return nil
+	}
 
 	// Create a patch for the namespace
 	patch := client.MergeFrom(namespace.DeepCopy())
